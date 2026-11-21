@@ -50,8 +50,8 @@ scoring, mean pinball loss on the logit scale):
   everything (90% coverage near 1.00 on synthetic cases), and the
   pinball loss pays for a band that is wider than honest.
 
-v4 changes (measured the same way; v2 0.3422 -> v4 0.2188 mean loss over
-18 synthetic cases, tuning 0.3118 -> 0.2060, holdout 0.3802 -> 0.2347):
+v4 changes (measured the same way; v2 0.3422 -> v4 0.2164 mean loss over
+18 synthetic cases, tuning 0.3118 -> 0.2020, holdout 0.3802 -> 0.2344):
 - Player-surge anticipation.  When the tracked player count jumps by
   more than 1.3x between two consecutive reads inside the last 24 hours,
   the 24h slope fit is contaminated: the surge dilutes every rate, the
@@ -77,10 +77,42 @@ v4 changes (measured the same way; v2 0.3422 -> v4 0.2188 mean loss over
   everybody holds stays everybody's: pinning the median at the ceiling
   removes the worst single-trophy losses.
 
+v5 changes (measured the same way; v4 0.2164 -> v5 0.1916 mean loss over
+the same 18 synthetic cases, tuning 0.2020 -> 0.1910, holdout 0.2344 ->
+0.1924; wins 14 of 18 scenarios, biggest wins hold2d 0.3800 -> 0.1802,
+hold2b 0.3562 -> 0.2389, slowJ60 0.2626 -> 0.2007; only real regression
+fastJ48 0.3400 -> 0.3668):
+- Horizon-scaled surge shift.  Diagnosing v4 showed the remaining loss
+  in jump scenarios is a median bias whose sign and size track the
+  horizon: 4.5-day-horizon jump cases under-forecast by +0.19 to +0.67
+  logit, while 3-day ones sit near zero.  The recovery from a surge is
+  convex -- the new cohort earns its way up the S-curve faster the
+  longer it has -- while the fit extrapolates a straight line, so the
+  shortfall grows with horizon.  The surge lift is now multiplied by
+  (horizon_days / 3) ** 1.25, so a 3-day horizon keeps v4's lift and a
+  4.5-day horizon lifts about 1.7x as much.  This was the single biggest
+  v5 win, and it wins on tuning and holdout separately.
+- Narrower diffusion again, 0.12 instead of 0.20 logit units per
+  root-day: with the median bias mostly fixed, the bands need even less
+  cover for a systematic miss, so the honest random-walk term shrinks
+  further.  Practice cases p00/p01 are unaffected in the median
+  (identical medians to v4; no surge fires on their flat history).
+
+Tried and rejected for v5 (each measured on the same 18 cases):
+- An excess-ratio surge detector (observed step divided by the
+  power-law-expected step, so natural fast growth cannot trip it):
+  no better than the plain ratio once the shift is re-tuned.
+- A late-jump allowance (shifting the median down in surge cases for
+  the second, near-target refresh step): clearly worse, holdout worst
+  case nearly doubles -- the visible-jump under-forecast dominates.
+- Widening the spread in surge cases, asymmetric spreads, a convexity
+  boost for early trophies, horizon-scaled damping, damping exponents
+  4 and 6: all worse or flat on one side of the split.
+
 Spread (the five quantiles) is a logit normal around that median with a
 standard deviation built from three honest sources: the scatter of the
 fit's residuals, the slope's standard error times the extrapolation gap,
-and a random-walk term of 0.20 logit units per root-day of horizon for the
+and a random-walk term of 0.12 logit units per root-day of horizon for the
 moves no trend can see (a refresh landing late, a weekend surge).  The
 total is floored at 0.30, capped at 1.30, and widened by 1.15 -- the
 pinball loss pays for overconfidence more than for a slightly wide band
@@ -129,7 +161,7 @@ MOVE_CAP = 4.0
 # A trophy at 99% or above never falls more than this many logit units.
 TOP_MOVE_CAP = 0.5
 # Random-walk diffusion of a rate's logit, per square-root day of horizon.
-DIFFUSION = 0.20
+DIFFUSION = 0.12
 # Spread widening applied on top of the combined standard deviation.
 SPREAD_SCALE = 1.15
 # Saturation damping exponent: a rising slope is multiplied by
@@ -140,9 +172,11 @@ DAMP_EXPONENT = 5.0
 JUMP_RATIO_THRESHOLD = 1.3
 # Median lift when a surge is seen, in logit units per ln(surge ratio),
 # capped at this many logit units so an extreme refresh step cannot
-# throw the median off a cliff.
+# throw the median off a cliff.  The lift scales with the horizon:
+# (horizon_days / 3) ** JUMP_SHIFT_HORIZON_EXP.
 JUMP_SHIFT_K = 0.9
 JUMP_SHIFT_CAP = 0.65
+JUMP_SHIFT_HORIZON_EXP = 1.25
 # A trophy at 99% or above is forecast at this median percent with this
 # spread (logit units).
 TOP_MEDIAN_PCT = 99.99
@@ -274,7 +308,6 @@ def fit_one(reads, target_hours):
     anchor = a + b * x_last
     return anchor, b, se_b, resid_sd, gap, usable[-1][2], len(window)
 
-
 def forecast_case(case):
     trophies = case["trophies"]
     history = case.get("history") or []
@@ -350,8 +383,14 @@ def forecast_case(case):
         if surge_seen:
             # The surge diluted the rates the fit just read; the new
             # cohort earns its way back up the S-curve over the horizon,
-            # so the median is lifted in proportion to the surge.
-            y += min(JUMP_SHIFT_K * math.log(surge_ratio), JUMP_SHIFT_CAP)
+            # so the median is lifted in proportion to the surge.  The
+            # lift grows with the horizon: the recovery is convex while
+            # the fit extrapolates straight, so the shortfall grows with
+            # horizon -- a 3-day horizon keeps v4's lift, a 3.75-day
+            # horizon lifts about 1.3x as much, a 4.5-day horizon about
+            # 1.7x as much.
+            horizon_factor = (max(horizon_days, 1.0) / 3.0) ** JUMP_SHIFT_HORIZON_EXP
+            y += min(JUMP_SHIFT_K * math.log(surge_ratio), JUMP_SHIFT_CAP) * horizon_factor
         cap = TOP_MOVE_CAP if (last_rate is not None and last_rate >= 99.0) else MOVE_CAP
         y = max(min(y, anchor + cap), anchor - cap)
         median_pct = pct_of_logit(y)
