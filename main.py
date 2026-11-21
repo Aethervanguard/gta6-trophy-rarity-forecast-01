@@ -50,10 +50,37 @@ scoring, mean pinball loss on the logit scale):
   everything (90% coverage near 1.00 on synthetic cases), and the
   pinball loss pays for a band that is wider than honest.
 
+v4 changes (measured the same way; v2 0.3422 -> v4 0.2188 mean loss over
+18 synthetic cases, tuning 0.3118 -> 0.2060, holdout 0.3802 -> 0.2347):
+- Player-surge anticipation.  When the tracked player count jumps by
+  more than 1.3x between two consecutive reads inside the last 24 hours,
+  the 24h slope fit is contaminated: the surge dilutes every rate, the
+  fit sees the drop and the first part of the recovery, and the
+  extrapolated median ends up far below where the rate actually lands
+  (the new cohort earns its way up the S-curve over the horizon).  So
+  when a surge is seen, the forecast median is lifted by
+  0.9 * ln(surge ratio) logit units, capped at 0.65.  The lift is proportional to the
+  surge, not a fixed constant, so a small refresh step lifts a little
+  and a big one lifts a lot.  This was the single biggest v4 win: it
+  turns the jump scenarios (v2's worst, up to 0.76 loss) into ordinary
+  ones.
+- Stronger saturation damping: a rising slope is now damped by
+  (1 - p)**5 instead of (1 - p).  Over a 3-5 day horizon the straight
+  line in log time overshoots far more than over one day, because the
+  S-curve flattens hard as a trophy saturates; the fifth power matches
+  that flattening.  Rare trophies (p near 0) are untouched.
+- Narrower diffusion, 0.20 instead of 0.35 logit units per root-day:
+  once the surge bias is fixed the bands no longer need to cover a
+  systematic miss, so the honest random-walk term is smaller.
+- A trophy at 99% or above is forecast at 99.99% with a 0.30 spread.
+  Near 100% a tenth of a percent is whole logit units, and a trophy
+  everybody holds stays everybody's: pinning the median at the ceiling
+  removes the worst single-trophy losses.
+
 Spread (the five quantiles) is a logit normal around that median with a
 standard deviation built from three honest sources: the scatter of the
 fit's residuals, the slope's standard error times the extrapolation gap,
-and a random-walk term of 0.35 logit units per root-day of horizon for the
+and a random-walk term of 0.20 logit units per root-day of horizon for the
 moves no trend can see (a refresh landing late, a weekend surge).  The
 total is floored at 0.30, capped at 1.30, and widened by 1.15 -- the
 pinball loss pays for overconfidence more than for a slightly wide band
@@ -102,9 +129,24 @@ MOVE_CAP = 4.0
 # A trophy at 99% or above never falls more than this many logit units.
 TOP_MOVE_CAP = 0.5
 # Random-walk diffusion of a rate's logit, per square-root day of horizon.
-DIFFUSION = 0.35
+DIFFUSION = 0.20
 # Spread widening applied on top of the combined standard deviation.
 SPREAD_SCALE = 1.15
+# Saturation damping exponent: a rising slope is multiplied by
+# (1 - p) ** DAMP_EXPONENT, p the trophy's last rate as a fraction.
+DAMP_EXPONENT = 5.0
+# A players surge between two consecutive reads inside the last 24h
+# (ratio above this) marks the window as surge-contaminated.
+JUMP_RATIO_THRESHOLD = 1.3
+# Median lift when a surge is seen, in logit units per ln(surge ratio),
+# capped at this many logit units so an extreme refresh step cannot
+# throw the median off a cliff.
+JUMP_SHIFT_K = 0.9
+JUMP_SHIFT_CAP = 0.65
+# A trophy at 99% or above is forecast at this median percent with this
+# spread (logit units).
+TOP_MEDIAN_PCT = 99.99
+TOP_SIGMA = 0.3
 # Floor for a trophy at the rounding floor: median at least this percent,
 # spread at least this many logit units.
 FLOOR_MEDIAN_PCT = 0.02
@@ -262,6 +304,22 @@ def forecast_case(case):
             reads.append((hours, players, rate))
         series.append(reads)
 
+    # Player-surge detection: the largest players jump between two
+    # consecutive reads inside the last 24 hours.  A surge dilutes every
+    # rate and contaminates the 24h slope fit, so when one is seen the
+    # forecast median is lifted below, in proportion to the surge.
+    # (players_tracked is per read, the same for every trophy, so the
+    # first trophy's series carries the whole story.)
+    surge_seen = False
+    surge_ratio = 1.0
+    if series:
+        ref = series[0]
+        t_last_all = max((t for (t, _n, _r) in ref), default=0.0)
+        for (t0, n0, _r0), (t1, n1, _r1) in zip(ref, ref[1:]):
+            if t1 >= t_last_all - WINDOW_HOURS and n0 and n1:
+                surge_ratio = max(surge_ratio, n1 / n0)
+        surge_seen = surge_ratio > JUMP_RATIO_THRESHOLD
+
     # First pass: each trophy's own fit, so tier medians can be built.
     fits = [fit_one(reads, target_hours) for reads in series]
     slopes_by_tier = {}
@@ -284,9 +342,16 @@ def forecast_case(case):
         shrunk = max(min(shrunk, SLOPE_CAP), -SLOPE_CAP)
         if shrunk > 0 and last_rate is not None:
             # A rising line overshoots a trophy that is already far up
-            # its S-curve: damp the rise by (1 - p), p the last rate.
-            shrunk *= (1.0 - last_rate / 100.0)
+            # its S-curve: damp the rise by (1 - p)**5, p the last rate.
+            # Over a 3-5 day horizon the flattening is far stronger than
+            # over one day, so the fifth power, not the first.
+            shrunk *= (1.0 - last_rate / 100.0) ** DAMP_EXPONENT
         y = anchor + shrunk * gap
+        if surge_seen:
+            # The surge diluted the rates the fit just read; the new
+            # cohort earns its way back up the S-curve over the horizon,
+            # so the median is lifted in proportion to the surge.
+            y += min(JUMP_SHIFT_K * math.log(surge_ratio), JUMP_SHIFT_CAP)
         cap = TOP_MOVE_CAP if (last_rate is not None and last_rate >= 99.0) else MOVE_CAP
         y = max(min(y, anchor + cap), anchor - cap)
         median_pct = pct_of_logit(y)
@@ -294,6 +359,12 @@ def forecast_case(case):
                           + (se_b * gap) ** 2
                           + (DIFFUSION * math.sqrt(max(horizon_days, 0.0))) ** 2)
         sigma = min(max(sigma, 0.30), 1.30) * SPREAD_SCALE
+        if last_rate is not None and last_rate >= 99.0:
+            # Everybody holds it and everybody keeps holding it: pin
+            # the median at the ceiling with a narrow band.  Near 100%
+            # a tenth of a percent is whole logit units.
+            median_pct = TOP_MEDIAN_PCT
+            sigma = TOP_SIGMA
         if last_rate is not None and last_rate <= 0.01:
             # At the rounding floor the history cannot show growth, yet
             # week one is when mid-game trophies switch on: lift the median
