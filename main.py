@@ -98,16 +98,35 @@ fastJ48 0.3400 -> 0.3668):
   further.  Practice cases p00/p01 are unaffected in the median
   (identical medians to v4; no surge fires on their flat history).
 
-Tried and rejected for v5 (each measured on the same 18 cases):
-- An excess-ratio surge detector (observed step divided by the
-  power-law-expected step, so natural fast growth cannot trip it):
-  no better than the plain ratio once the shift is re-tuned.
-- A late-jump allowance (shifting the median down in surge cases for
-  the second, near-target refresh step): clearly worse, holdout worst
-  case nearly doubles -- the visible-jump under-forecast dominates.
-- Widening the spread in surge cases, asymmetric spreads, a convexity
-  boost for early trophies, horizon-scaled damping, damping exponents
-  4 and 6: all worse or flat on one side of the split.
+v6 changes (measured the same way; v5 0.1916 -> v6 0.1762 mean loss over
+the same 18 synthetic cases, tuning 0.1910 -> 0.1659, holdout 0.1924 ->
+0.1890; improves 5 scenarios, worsens none, leaves 13 unchanged;
+biggest win fastJ48 0.3668 -> 0.1532):
+- Jump-age ramp on the surge lift.  Diagnosing v5 showed fastJ48's
+  whole loss is the lift itself: its no-lift forecast is nearly
+  unbiased, yet it gets the full +0.65 lift, overshooting every trophy
+  by +0.56 logit on average.  The reason is timing: fastJ48's surge
+  landed 1.7 hours before the cut, so the 24h fit window contains
+  almost no post-surge reads -- the fit is still the pre-surge trend,
+  which extrapolates correctly, and the lift double-counts the
+  recovery.  In every other jump scenario the surge landed 5.5-12
+  hours before the cut, the fit window is full of the drop and its
+  partial recovery, the fitted slope is dragged down, and the lift is
+  genuinely needed.  So the lift now ramps with the surge's age:
+  multiplied by min(1, jump_age_hours / 7), where jump_age_hours is
+  the time from the surge step to the last read.  A fresh surge gets
+  little lift; a surge 7+ hours old gets the full lift.  The 6-7 hour
+  ramp is a broad plateau (6h and 7h score within 0.0003 of each
+  other), not a knife-edge.
+- Horizon exponent 1.25 -> 1.40: the 4.5-day lift grows a little
+  (about 1.8x the 3-day lift instead of 1.7x), which the holdout
+  jump scenarios prefer; 3-day horizons are untouched.
+- Tried and rejected for v6 (each measured on the same 18 cases):
+  per-trophy slope-scaled lift (helps tuning but hurts holdout --
+  the slope conflates the old cohort's rise with the new cohort's
+  recovery); scaling the lift by the players growth exponent
+  (much worse on holdout); shrinkage prior 2 and 6, floor median
+  0.01% and 0.05% (all flat); diffusion 0.10 and 0.14 (flat).
 
 Spread (the five quantiles) is a logit normal around that median with a
 standard deviation built from three honest sources: the scatter of the
@@ -173,10 +192,14 @@ JUMP_RATIO_THRESHOLD = 1.3
 # Median lift when a surge is seen, in logit units per ln(surge ratio),
 # capped at this many logit units so an extreme refresh step cannot
 # throw the median off a cliff.  The lift scales with the horizon:
-# (horizon_days / 3) ** JUMP_SHIFT_HORIZON_EXP.
+# (horizon_days / 3) ** JUMP_SHIFT_HORIZON_EXP.  It also ramps with the
+# surge's age: a surge that just happened has barely contaminated the
+# 24h fit, so the lift is multiplied by
+# min(1, jump_age_hours / LIFT_RAMP_HOURS).
 JUMP_SHIFT_K = 0.9
 JUMP_SHIFT_CAP = 0.65
-JUMP_SHIFT_HORIZON_EXP = 1.25
+JUMP_SHIFT_HORIZON_EXP = 1.4
+LIFT_RAMP_HOURS = 7.0
 # A trophy at 99% or above is forecast at this median percent with this
 # spread (logit units).
 TOP_MEDIAN_PCT = 99.99
@@ -271,7 +294,6 @@ def release_instant(case):
         return parse_time(raw)
     return parse_time(RELEASE_FALLBACK)
 
-
 def fit_one(reads, target_hours):
     """One trophy's own fit.
 
@@ -338,20 +360,27 @@ def forecast_case(case):
         series.append(reads)
 
     # Player-surge detection: the largest players jump between two
-    # consecutive reads inside the last 24 hours.  A surge dilutes every
-    # rate and contaminates the 24h slope fit, so when one is seen the
-    # forecast median is lifted below, in proportion to the surge.
-    # (players_tracked is per read, the same for every trophy, so the
-    # first trophy's series carries the whole story.)
+    # consecutive reads inside the last 24 hours, and how long ago it
+    # happened.  A surge dilutes every rate and contaminates the 24h
+    # slope fit, so when one is seen the forecast median is lifted
+    # below, in proportion to the surge.  (players_tracked is per read,
+    # the same for every trophy, so the first trophy's series carries
+    # the whole story.)
     surge_seen = False
     surge_ratio = 1.0
+    jump_age_hours = 0.0
     if series:
         ref = series[0]
         t_last_all = max((t for (t, _n, _r) in ref), default=0.0)
+        jump_t = None
         for (t0, n0, _r0), (t1, n1, _r1) in zip(ref, ref[1:]):
             if t1 >= t_last_all - WINDOW_HOURS and n0 and n1:
-                surge_ratio = max(surge_ratio, n1 / n0)
+                if n1 / n0 > surge_ratio:
+                    surge_ratio = n1 / n0
+                    jump_t = t1
         surge_seen = surge_ratio > JUMP_RATIO_THRESHOLD
+        if jump_t is not None:
+            jump_age_hours = max(t_last_all - jump_t, 0.0)
 
     # First pass: each trophy's own fit, so tier medians can be built.
     fits = [fit_one(reads, target_hours) for reads in series]
@@ -386,11 +415,17 @@ def forecast_case(case):
             # so the median is lifted in proportion to the surge.  The
             # lift grows with the horizon: the recovery is convex while
             # the fit extrapolates straight, so the shortfall grows with
-            # horizon -- a 3-day horizon keeps v4's lift, a 3.75-day
-            # horizon lifts about 1.3x as much, a 4.5-day horizon about
-            # 1.7x as much.
+            # horizon -- a 3-day horizon keeps v4's lift, a 4.5-day
+            # horizon lifts about 1.8x as much.  And the lift ramps with
+            # the surge's age: a surge that landed an hour or two before
+            # the cut has barely contaminated the 24h fit (the fit is
+            # still the pre-surge trend, which extrapolates correctly),
+            # so it gets little lift; a surge 7+ hours old has dragged
+            # the fitted slope down and earns the full lift.
             horizon_factor = (max(horizon_days, 1.0) / 3.0) ** JUMP_SHIFT_HORIZON_EXP
-            y += min(JUMP_SHIFT_K * math.log(surge_ratio), JUMP_SHIFT_CAP) * horizon_factor
+            ramp = min(1.0, jump_age_hours / LIFT_RAMP_HOURS)
+            y += min(JUMP_SHIFT_K * math.log(surge_ratio), JUMP_SHIFT_CAP) \
+                * horizon_factor * ramp
         cap = TOP_MOVE_CAP if (last_rate is not None and last_rate >= 99.0) else MOVE_CAP
         y = max(min(y, anchor + cap), anchor - cap)
         median_pct = pct_of_logit(y)
