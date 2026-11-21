@@ -1,9 +1,9 @@
 """Forecast GTA VI (PS5) trophy earn rates on Exophase at a case's target.
 
-For every trophy in a case, this program forecasts five quantiles of its earn
-rate (percent of tracked players who hold it) at the target instant, from the
-history of Exophase reads the case carries.  It is a trend forecaster, not a
-persistence one: launch week is when earn rates move fastest, and a trophy
+For every trophy in a case, this program forecasts five quantiles of its
+earn rate (percent of tracked players who hold it) at the target instant,
+from the history of Exophase reads the case carries.  It is a trend
+forecaster: launch week is when earn rates move fastest, and a trophy
 that sits still today is usually climbing or falling tomorrow.
 
 Model, per trophy
@@ -24,28 +24,50 @@ silver, bronze; tiers with fewer than four trophies borrow the global median
 slope instead), because a single trophy's day of reads is noisy -- the
 2-decimal rounding alone swings a rare trophy's logit by a lot -- while its
 tier-mates share the same launch dynamics.  The shrunk slope is capped at
-+/-2.5 so no trophy is ever extrapolated off a cliff.  The forecast anchors
++/-2.0 so no trophy is ever extrapolated off a cliff.  The forecast anchors
 on the fitted level at the last read and moves it by the shrunk slope times
-the log-time gap to the target, never more than 4 logit units either way.
+the log-time gap to the target, never more than 4 logit units either way --
+except a trophy at 99% or above, which never falls more than 0.5 logit
+units (see the v2 changes below).
+
+v2 changes (measured on synthetic final-like cases against the same
+scoring, mean pinball loss on the logit scale):
+- A rising slope is damped by (1 - p), p the trophy's last rate as a
+  fraction.  A straight line in log time overshoots a trophy that is
+  already a long way up its S-curve: its true curve flattens as it nears
+  saturation, while the line keeps climbing.  The damping costs nothing
+  for rare trophies (p near 0) and bites hardest where the overshoot
+  lives, at mid rates.  This was the single biggest measured win.
+- The slope cap is 2.0, not 2.5: the extra headroom only ever fed
+  overshoots on the same flattening trophies.
+- A trophy at 99% or above may not fall more than 0.5 logit units.  A
+  trophy everybody holds does not lose holders; its rate only ever dips
+  when a refresh jumps the player count, and new players earn so trivial
+  a trophy within hours, so the rate recovers.  Letting the fitted line
+  drag it down several logit units was the worst single-trophy loss in
+  testing.
+- The spread widening is 1.15, not 1.3: the bands were covering
+  everything (90% coverage near 1.00 on synthetic cases), and the
+  pinball loss pays for a band that is wider than honest.
 
 Spread (the five quantiles) is a logit normal around that median with a
-standard deviation built from three honest sources: the scatter of the fit's
-residuals, the slope's standard error times the extrapolation gap, and a
-random-walk term of 0.35 logit units per root-day of horizon for the moves
-no trend can see (a refresh landing late, a weekend surge).  The total is
-floored at 0.30, capped at 1.30, and widened by 1.3 -- the pinball loss pays
-for overconfidence more than for a slightly wide band when the median itself
-is uncertain.
+standard deviation built from three honest sources: the scatter of the
+fit's residuals, the slope's standard error times the extrapolation gap,
+and a random-walk term of 0.35 logit units per root-day of horizon for the
+moves no trend can see (a refresh landing late, a weekend surge).  The
+total is floored at 0.30, capped at 1.30, and widened by 1.15 -- the
+pinball loss pays for overconfidence more than for a slightly wide band
+when the median itself is uncertain.
 
-Trophies sitting at the rounding floor (last rate 0.01% or below) get special
-handling: their history cannot show growth, yet week one is exactly when
-mid-game trophies switch on, so their median is lifted to at least 0.02% and
-their spread widened to at least 1.3 logit units.  A trophy that never
-switches on pays a little for the lift; one that does pays far less for the
-cover.
+Trophies sitting at the rounding floor (last rate 0.01% or below) get
+special handling: their history cannot show growth, yet week one is
+exactly when mid-game trophies switch on, so their median is lifted to at
+least 0.02% and their spread widened to at least 1.3 logit units.  A trophy
+that never switches on pays a little for the lift; one that does pays far
+less for the cover.
 
-Everything is deterministic: no randomness, no wall-clock reads, no network.
-The same case file always produces the same bytes.
+Everything is deterministic: no randomness, no wall-clock reads, no
+network.  The same case file always produces the same bytes.
 
 Run as:  python3 main.py
 Reads  $MAKEFUN_INPUT_DIR (else /input)  for *.in, writes *.out to
@@ -66,20 +88,23 @@ LEVELS = [0.05, 0.25, 0.5, 0.75, 0.95]
 # Standard normal quantiles at those levels.
 Z_SCORES = [-1.645, -0.674, 0.0, 0.674, 1.645]
 
-# Log-time scale: progress is measured in ln(1 + hours / TIME_SCALE).
-TIME_SCALE = 12.0
+# Log-time scale: progress is measured in ln(1 + hours / LOG_SCALE).
+LOG_SCALE = 12.0
 # Only reads this recent (hours before the last read) inform the slope.
 WINDOW_HOURS = 24.0
-# Shrinkage strength of a trophy's slope toward its tier median (pseudo-reads).
+# Shrinkage strength of a trophy's slope toward its tier median
+# (pseudo-reads).
 SHRINK_PRIOR = 4.0
 # The shrunk slope never exceeds this, in logit units per log-time unit.
-SLOPE_CAP = 2.5
+SLOPE_CAP = 2.0
 # The forecast never moves more than this many logit units from its anchor.
 MOVE_CAP = 4.0
+# A trophy at 99% or above never falls more than this many logit units.
+TOP_MOVE_CAP = 0.5
 # Random-walk diffusion of a rate's logit, per square-root day of horizon.
 DIFFUSION = 0.35
 # Spread widening applied on top of the combined standard deviation.
-SPREAD_SCALE = 1.3
+SPREAD_SCALE = 1.15
 # Floor for a trophy at the rounding floor: median at least this percent,
 # spread at least this many logit units.
 FLOOR_MEDIAN_PCT = 0.02
@@ -119,7 +144,8 @@ def round4(x):
     return int(value) if value == int(value) else value
 
 
-def median_of(values):
+def typical(values):
+    """Median of a list (0.0 when empty)."""
     ordered = sorted(values)
     n = len(ordered)
     if n == 0:
@@ -129,12 +155,12 @@ def median_of(values):
     return 0.5 * (ordered[n // 2 - 1] + ordered[n // 2])
 
 
-def fit_line(xs, ys):
+def wls(xs, ys):
     """Ordinary least squares of y on x.  Returns (a, b, se_b, resid_sd).
 
-    a + b*x is the fitted line, se_b the slope's standard error and resid_sd
-    the residual standard deviation.  With fewer than two distinct x values
-    the slope is zero and the line sits at the mean of y.
+    a + b*x is the fitted line, se_b the slope's standard error and
+    resid_sd the residual standard deviation.  With fewer than two distinct
+    x values the slope is zero and the line sits at the mean of y.
     """
     n = len(xs)
     if n == 0:
@@ -157,7 +183,7 @@ def fit_line(xs, ys):
 
 def log_time(hours_since_release):
     """Log-time coordinate, guarded for reads just before release."""
-    return math.log(max(1.0 + hours_since_release / TIME_SCALE, 0.01))
+    return math.log(max(1.0 + hours_since_release / LOG_SCALE, 0.01))
 
 
 def release_instant(case):
@@ -168,19 +194,20 @@ def release_instant(case):
     if len(raw) > 10:
         return parse_time(raw)
     return parse_time(RELEASE_FALLBACK)
-    """Log-time coordinate, guarded for reads just before release."""
-    return math.log(max(1.0 + hours_since_release / TIME_SCALE, 0.01))
 
 
-def forecast_trophy(reads, target_hours, horizon_days):
-    """Median percent and logit sigma for one trophy at the target.
+def fit_one(reads, target_hours):
+    """One trophy's own fit.
 
     reads: list of (hours_since_release, players_tracked, rate_pct_or_None),
-    oldest first.  target_hours: hours since release at the target.
+    oldest first.  Returns (anchor, slope, se_b, resid_sd, gap, last_rate,
+    n_window), or None when there is no usable history.  anchor is the
+    fitted logit at the last read; gap is the log-time distance to the
+    target; last_rate is the rate in the last read.
     """
     usable = [(t, n, r) for (t, n, r) in reads if r is not None and n and n > 0]
     if not usable:
-        return FALLBACK_MEDIAN_PCT, FALLBACK_SIGMA
+        return None
     t_last = usable[-1][0]
     x_last = log_time(t_last)
     x_target = log_time(target_hours)
@@ -201,9 +228,9 @@ def forecast_trophy(reads, target_hours, horizon_days):
         window = points[-2:] if len(points) >= 2 else points
     xs = [log_time(t) for (t, _y) in window]
     ys = [y for (_t, y) in window]
-    a, b, se_b, resid_sd = fit_line(xs, ys)
+    a, b, se_b, resid_sd = wls(xs, ys)
     anchor = a + b * x_last
-    return anchor, b, se_b, resid_sd, gap, usable[-1][2]
+    return anchor, b, se_b, resid_sd, gap, usable[-1][2], len(window)
 
 
 def forecast_case(case):
@@ -236,32 +263,32 @@ def forecast_case(case):
         series.append(reads)
 
     # First pass: each trophy's own fit, so tier medians can be built.
-    fits = []
-    for reads in series:
-        fits.append(forecast_trophy(reads, target_hours, horizon_days))
+    fits = [fit_one(reads, target_hours) for reads in series]
     slopes_by_tier = {}
     for trophy, fit in zip(trophies, fits):
-        if isinstance(fit, tuple) and len(fit) == 6:
+        if fit is not None:
             slopes_by_tier.setdefault(trophy.get("tier", "bronze"), []).append(fit[1])
-    all_slopes = [fit[1] for fit in fits if isinstance(fit, tuple) and len(fit) == 6]
-    global_slope = median_of(all_slopes)
+    all_slopes = [fit[1] for fit in fits if fit is not None]
+    global_slope = typical(all_slopes)
 
     rows = []
     for trophy, reads, fit in zip(trophies, series, fits):
-        if not (isinstance(fit, tuple) and len(fit) == 6):
-            median_pct, sigma = fit[0], fit[1]
-            rows.append((trophy["id"], median_pct, sigma))
+        if fit is None:
+            rows.append((trophy["id"], FALLBACK_MEDIAN_PCT, FALLBACK_SIGMA))
             continue
-        anchor, slope, se_b, resid_sd, gap, last_rate = fit
+        anchor, slope, se_b, resid_sd, gap, last_rate, n_window = fit
         tier = trophy.get("tier", "bronze")
         tier_slopes = slopes_by_tier.get(tier, [])
-        prior = median_of(tier_slopes) if len(tier_slopes) >= 4 else global_slope
-        n_window = max(1, sum(1 for (t, _n, _r) in reads
-                              if t >= reads[-1][0] - WINDOW_HOURS and _r is not None))
+        prior = typical(tier_slopes) if len(tier_slopes) >= 4 else global_slope
         shrunk = (slope * n_window + prior * SHRINK_PRIOR) / (n_window + SHRINK_PRIOR)
         shrunk = max(min(shrunk, SLOPE_CAP), -SLOPE_CAP)
+        if shrunk > 0 and last_rate is not None:
+            # A rising line overshoots a trophy that is already far up
+            # its S-curve: damp the rise by (1 - p), p the last rate.
+            shrunk *= (1.0 - last_rate / 100.0)
         y = anchor + shrunk * gap
-        y = max(min(y, anchor + MOVE_CAP), anchor - MOVE_CAP)
+        cap = TOP_MOVE_CAP if (last_rate is not None and last_rate >= 99.0) else MOVE_CAP
+        y = max(min(y, anchor + cap), anchor - cap)
         median_pct = pct_of_logit(y)
         sigma = math.sqrt(max(resid_sd, 0.15) ** 2
                           + (se_b * gap) ** 2
@@ -273,7 +300,6 @@ def forecast_case(case):
             # a touch and widen the band to cover an emergence.
             median_pct = max(median_pct, FLOOR_MEDIAN_PCT)
             sigma = max(sigma, FLOOR_SIGMA)
-            y = logit_of_pct(median_pct)
         rows.append((trophy["id"], median_pct, sigma))
 
     out_rows = []
